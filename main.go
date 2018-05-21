@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -23,10 +24,23 @@ import (
 
 var log = logrus.New()
 
+// go build -ldflags "-X main.GitId=`git rev-parse --short=7 HEAD`"
+var build string
+var osversion string = runtime.GOOS
+
+func printVersionInfo() {
+	fmt.Printf("say v1 (%s) %s\n", build, osversion)
+}
+
 func main() {
 	var inputpath string
 	flag.StringVar(&inputpath, "f", "", "optional path to input file")
+	flag.BoolVar(&versionflag, "v", false, "print version")
 	flag.Parse()
+	if v {
+		printVersionInfo()
+		os.Exit(0)
+	}
 
 	speaker := NewPolly("test", 4)
 
