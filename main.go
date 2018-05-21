@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ import (
 
 var log = logrus.New()
 
-// go build -ldflags "-X main.GitId=`git rev-parse --short=7 HEAD`"
+// go install -ldflags "-X main.build=`git rev-parse --short=7 HEAD`"
 var build string
 var osversion string = runtime.GOOS
 
@@ -44,7 +45,12 @@ func main() {
 		os.Exit(0)
 	}
 
-	speaker := NewPolly("test", 4)
+	name := "echo"
+	if len(inputpath) > 0 {
+		// filename without extension
+		name = strings.TrimSuffix(filepath.Base(inputpath), filepath.Ext(name))
+	}
+	speaker := NewPolly(name, 4)
 
 	var doc []string
 	doc = append(doc, flag.Arg(0))
@@ -293,8 +299,8 @@ func parseFile(filename string) []string {
 				block = sentence + "."
 				continue
 			}
+			log.Fatalf("sentence is too long for a single request %q", sentence)
 		}
-		panic("sentence is too long for a single request.")
 	}
 	fmt.Println(strings.Repeat("-", 80))
 	return append(blocks, block)
