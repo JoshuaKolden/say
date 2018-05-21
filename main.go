@@ -48,7 +48,9 @@ func main() {
 	name := "echo"
 	if len(inputpath) > 0 {
 		// filename without extension
-		name = strings.TrimSuffix(filepath.Base(inputpath), filepath.Ext(name))
+		name = filepath.Base(inputpath)
+		name = strings.TrimSuffix(name, filepath.Ext(name))
+		fmt.Printf("name: %q\n", name)
 	}
 	speaker := NewPolly(name, 4)
 
