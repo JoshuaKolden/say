@@ -34,10 +34,12 @@ func printVersionInfo() {
 
 func main() {
 	var inputpath string
+	var versionflag bool
 	flag.StringVar(&inputpath, "f", "", "optional path to input file")
 	flag.BoolVar(&versionflag, "v", false, "print version")
 	flag.Parse()
-	if v {
+
+	if versionflag {
 		printVersionInfo()
 		os.Exit(0)
 	}
