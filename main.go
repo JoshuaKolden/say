@@ -14,8 +14,6 @@ import (
 
 	"github.com/Avalanche-io/c4d/counter"
 
-	humanize "github.com/dustin/go-humanize"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -50,7 +48,6 @@ func main() {
 		// filename without extension
 		name = filepath.Base(inputpath)
 		name = strings.TrimSuffix(name, filepath.Ext(name))
-		fmt.Printf("name: %q\n", name)
 	}
 	speaker := NewPolly(name, 4)
 
@@ -65,7 +62,7 @@ func main() {
 	speaker.Close()
 
 	for i := 0; ; i++ {
-		filename := fmt.Sprintf("%s%04d.mp3", "test", i)
+		filename := fmt.Sprintf("%s%04d.mp3", name, i)
 		_, err := os.Stat(filename)
 		if err != nil {
 			break
@@ -170,7 +167,7 @@ func writeAudio(name string, size *counter.C, i int, stream io.Reader) {
 	}
 
 	size.Add(uint64(len(data)))
-	log.Infof("%s: %s / %s", filename, humanize.Bytes(uint64(len(data))), humanize.Bytes(uint64(*size)))
+	// log.Infof("%s: %s / %s", filename, humanize.Bytes(uint64(len(data))), humanize.Bytes(uint64(*size)))
 }
 
 func (p *Polly) Close() error {
@@ -259,7 +256,7 @@ func parseFile(filename string) []string {
 	paragraphs := strings.Split(string(runeData), "\n")
 	var blocks []string
 	var block string
-	fmt.Printf("paragraphs: %d\n", len(paragraphs))
+
 	// for each newline
 	for i := 0; i < len(paragraphs); i++ {
 		// if it is empty, continue
@@ -275,8 +272,6 @@ func parseFile(filename string) []string {
 		}
 		// if it is too big, save the existing block, and create a new empty one.
 		blocks = append(blocks, block)
-		fmt.Printf("% 4d%s\n", len(block), strings.Repeat("-", 80))
-		fmt.Println(block)
 		block = ""
 
 		// if it fits now, add it to the new block and continue
@@ -297,14 +292,12 @@ func parseFile(filename string) []string {
 			block = ""
 
 			if len(block)+len(sentence)+1 < 1500 {
-				// fmt.Printf("%s.\n", sentence)
 				block = sentence + "."
 				continue
 			}
 			log.Fatalf("sentence is too long for a single request %q", sentence)
 		}
 	}
-	fmt.Println(strings.Repeat("-", 80))
 	return append(blocks, block)
 }
 
