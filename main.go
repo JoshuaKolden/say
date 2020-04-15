@@ -11,11 +11,14 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
-	"github.com/Avalanche-io/c4d/counter"
+	"github.com/mitchellh/go-homedir"
+	ini "gopkg.in/ini.v1"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/polly"
 	"github.com/sirupsen/logrus"
@@ -28,7 +31,7 @@ var build string
 var osversion string = runtime.GOOS
 
 func printVersionInfo() {
-	fmt.Printf("say v1 (%s) %s\n", build, osversion)
+	fmt.Printf("say v2 (%s) %s\n", build, osversion)
 }
 
 func main() {
@@ -37,20 +40,30 @@ func main() {
 	flag.StringVar(&inputpath, "f", "", "optional path to input file")
 	flag.BoolVar(&versionflag, "v", false, "print version")
 	flag.Parse()
+	fmt.Printf("input: %q\n", inputpath)
 
 	if versionflag {
 		printVersionInfo()
 		os.Exit(0)
 	}
 
+	if strings.HasPrefix(inputpath, "~") {
+		inputpath = strings.TrimLeft(inputpath, "~/")
+		home, err := homedir.Dir()
+		if err != nil {
+			log.Fatal(err)
+		}
+		inputpath = filepath.Join(home, inputpath)
+	}
 	name := "echo"
 	if len(inputpath) > 0 {
+
 		// filename without extension
 		name = filepath.Base(inputpath)
 		name = strings.TrimSuffix(name, filepath.Ext(name))
 	}
 	speaker := NewPolly(name, 4)
-
+	fmt.Printf("name: %q\n", name)
 	var doc []string
 	doc = append(doc, flag.Arg(0))
 
@@ -85,13 +98,62 @@ type intstr struct {
 	s string
 }
 
+func loadCredentials() (*credentials.Credentials, error) {
+	home, err := homedir.Dir()
+	if err != nil {
+		return nil, err
+	}
+	configpath := filepath.Join(home, ".aws", "config")
+	f, err := os.Open(configpath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	cfg, err := ini.Load(f)
+	if err != nil {
+		return nil, err
+	}
+	def := cfg.Section("default")
+	k, err := def.GetKey("aws_access_key_id")
+	if err != nil {
+		return nil, err
+	}
+	id := k.String()
+
+	k, err = def.GetKey("aws_secret_access_key")
+	if err != nil {
+		return nil, err
+	}
+	secret := k.String()
+
+	creds := credentials.NewStaticCredentials(id, secret, "")
+	_, err = creds.Get()
+	if err == nil {
+		return creds, nil
+	}
+	creds = credentials.NewEnvCredentials()
+	_, err = creds.Get()
+	if err != nil {
+		return nil, err
+	}
+
+	return creds, nil
+}
+
 func NewPolly(name string, threads int) *Polly {
 	// awsLog := aws.LoggerFunc(func(args ...interface{}) {
 	// 	log.Println(args...)
 	// })
+	creds, err := loadCredentials()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	awsCfg := &aws.Config{
 		Region: aws.String("us-east-1"),
 		CredentialsChainVerboseErrors: aws.Bool(true),
+		Credentials:                   creds,
 		// Credentials:                   credentials.NewStaticCredentials("account id", "secret key", ""),
 		// LogLevel:                      aws.LogLevel(aws.LogDebug | aws.LogDebugWithSigning | aws.LogDebugWithHTTPBody),
 		// Logger:                        awsLog,
@@ -102,7 +164,7 @@ func NewPolly(name string, threads int) *Polly {
 
 	p := &Polly{ch: make(chan *intstr, 1)}
 
-	var size counter.C
+	var size int64
 	p.wg.Add(threads)
 
 	var off int
@@ -153,7 +215,7 @@ func NewPolly(name string, threads int) *Polly {
 	return p
 }
 
-func writeAudio(name string, size *counter.C, i int, stream io.Reader) {
+func writeAudio(name string, size *int64, i int, stream io.Reader) {
 	data, err := ioutil.ReadAll(stream)
 	if err != nil {
 		log.Error(err)
@@ -166,7 +228,7 @@ func writeAudio(name string, size *counter.C, i int, stream io.Reader) {
 		log.Error(err)
 	}
 
-	size.Add(uint64(len(data)))
+	atomic.AddInt64(size, int64(len(data)))
 	// log.Infof("%s: %s / %s", filename, humanize.Bytes(uint64(len(data))), humanize.Bytes(uint64(*size)))
 }
 
@@ -213,9 +275,15 @@ func pollyError(err error) {
 
 }
 func parseFile(filename string) []string {
-	f, err := os.Open(filename)
+
+	abs, err := filepath.Abs(filename)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("error opening %q: %s", filename, err)
+	}
+
+	f, err := os.Open(abs)
+	if err != nil {
+		log.Fatalf("error opening %q: %s", abs, err)
 	}
 	defer f.Close()
 
@@ -223,6 +291,7 @@ func parseFile(filename string) []string {
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Infof("finished reading %q", filename)
 	var runeData []rune
 	for _, r := range []rune(string(data)) {
 		switch r {
