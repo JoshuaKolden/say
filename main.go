@@ -14,11 +14,9 @@ import (
 	"sync/atomic"
 
 	"github.com/mitchellh/go-homedir"
-	ini "gopkg.in/ini.v1"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/polly"
 	"github.com/sirupsen/logrus"
@@ -30,48 +28,45 @@ var log = logrus.New()
 var build string
 var osversion string = runtime.GOOS
 
-func printVersionInfo() {
-	fmt.Printf("say v2 (%s) %s\n", build, osversion)
-}
-
 func main() {
 	var inputpath string
-	var versionflag bool
-	flag.StringVar(&inputpath, "f", "", "optional path to input file")
-	flag.BoolVar(&versionflag, "v", false, "print version")
-	flag.Parse()
-	fmt.Printf("input: %q\n", inputpath)
+	var showVersion, polyFlag bool
 
-	if versionflag {
-		printVersionInfo()
+	flag.StringVar(&inputpath, "f", "", "optional path to text input")
+	flag.BoolVar(&polyFlag, "p", true, "skip poly, and play audio (if all mp3s exist)")
+	flag.BoolVar(&showVersion, "v", false, "print version")
+	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("say v3 (%s) %s\n", build, osversion)
 		os.Exit(0)
 	}
 
-	if strings.HasPrefix(inputpath, "~") {
-		inputpath = strings.TrimLeft(inputpath, "~/")
-		home, err := homedir.Dir()
-		if err != nil {
-			log.Fatal(err)
-		}
-		inputpath = filepath.Join(home, inputpath)
+	if len(inputpath) != 0 {
+		fmt.Printf("input: %q\n", inputpath)
 	}
+
+	inputpath, err := TildePath(inputpath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		os.Exit(1)
+	}
+
 	name := "echo"
 	if len(inputpath) > 0 {
-
 		// filename without extension
 		name = filepath.Base(inputpath)
 		name = strings.TrimSuffix(name, filepath.Ext(name))
 	}
-	speaker := NewPolly(name, 4)
-	fmt.Printf("name: %q\n", name)
-	var doc []string
-	doc = append(doc, flag.Arg(0))
 
-	if len(inputpath) > 0 {
-		doc = parseFile(inputpath)
+	speaker := NewPolly(4)
+
+	doc := ReadTextInput(inputpath)
+	if len(inputpath) == 0 {
+		doc = append(doc, flag.Arg(0))
 	}
-	speaker.SayAll(doc)
 
+	speaker.SayAll(doc)
 	speaker.Close()
 
 	for i := 0; ; i++ {
@@ -83,7 +78,8 @@ func main() {
 		cmd := exec.Command("/usr/bin/afplay", "-q", "1", filename)
 		err = cmd.Run()
 		if err != nil {
-			log.Error(err)
+			// log.Error(err)
+			fmt.Fprintf(os.Stderr, "%s\n", err)
 		}
 	}
 }
@@ -98,6 +94,7 @@ type intstr struct {
 	s string
 }
 
+/*
 func loadCredentials() (*credentials.Credentials, error) {
 	home, err := homedir.Dir()
 	if err != nil {
@@ -140,96 +137,121 @@ func loadCredentials() (*credentials.Credentials, error) {
 
 	return creds, nil
 }
+*/
 
-func NewPolly(name string, threads int) *Polly {
-	// awsLog := aws.LoggerFunc(func(args ...interface{}) {
-	// 	log.Println(args...)
-	// })
-	creds, err := loadCredentials()
+func NewAWSSession(identity, region string) (*session.Session, error) {
+	creds, err := LoadAWSCredentials(identity)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	awsCfg := &aws.Config{
-		Region: aws.String("us-east-1"),
+		Region:                        &region,
 		CredentialsChainVerboseErrors: aws.Bool(true),
 		Credentials:                   creds,
-		// Credentials:                   credentials.NewStaticCredentials("account id", "secret key", ""),
-		// LogLevel:                      aws.LogLevel(aws.LogDebug | aws.LogDebugWithSigning | aws.LogDebugWithHTTPBody),
-		// Logger:                        awsLog,
 	}
 
-	sess := session.New(awsCfg)
+	return session.New(awsCfg), nil
+}
+
+func NewPolly(threads int) *Polly {
+	sess, err := NewAWSSession("default", "us-east-1")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		os.Exit(2)
+	}
+
 	svc := polly.New(sess)
 
-	p := &Polly{ch: make(chan *intstr, 1)}
+	polyInput := polly.SynthesizeSpeechInput{
+		OutputFormat: aws.String("mp3"),
+		SampleRate:   aws.String("22050"),
+		TextType:     aws.String("ssml"),
+		VoiceId:      aws.String("Brian"),
+	}
+	printError := func(err error, quote string) {
+		if err != nil {
+			return
+		}
+
+		if len(quote) == 0 {
+			fmt.Fprintf(os.Stderr, "Error %s\n", err)
+			return
+		}
+
+		fmt.Fprintf(os.Stderr, "Error %s\n%s\n", err, quote)
+	}
 
 	var size int64
-	p.wg.Add(threads)
-
 	var off int
+
+	p := &Polly{ch: make(chan *intstr, 1)}
+	p.wg.Add(threads)
 	for i := 0; i < threads; i++ {
 		go func(i int) {
 			defer p.wg.Done()
-			input := &polly.SynthesizeSpeechInput{
-				OutputFormat: aws.String("mp3"),
-				SampleRate:   aws.String("22050"),
-				TextType:     aws.String("ssml"),
-				VoiceId:      aws.String("Brian"),
-			}
 
 			for is := range p.ch {
-				if len(is.s) == 0 {
+				section := is.s
+				if len(section) == 0 {
 					continue
 				}
+				input := polyInput
 
-				phrase := "<speak><prosody rate='1.3'>" + is.s + "</prosody></speak>"
+				phrase := "<speak><prosody rate='1.3'>" + section + "</prosody></speak>"
+
 				input.Text = &phrase
-
-				result, err := svc.SynthesizeSpeech(input)
+				rsp, err := svc.SynthesizeSpeech(&input)
 				if err != nil {
-					log.Errorf("Error %s\n%s\n", err, is.s)
-					sentences := strings.Split(is.s, ".")
-					for _, s := range sentences {
-						phrase := "<speak><prosody rate='1.3'>" + s + ".</prosody></speak>"
+					printError(err, section)
+					// fmt.Fprintf(os.Stderr, errfmt, err, section)
+					// Sub-devide the input by sentince, and try again.
+					sentences := strings.Split(section, ".")
+					for _, sentence := range sentences {
+
 						input.Text = &phrase
-						result, err = svc.SynthesizeSpeech(input)
+						rsp, err = svc.SynthesizeSpeech(&input)
 						if err != nil {
-							log.Fatalf("Error %s\n%s\n", err, s)
+							// fmt.Fprintf(os.Stderr, errfmt, err, s)
+							printError(err, sentence)
+							continue
 						}
-						writeAudio(name, &size, is.i+off, result.AudioStream)
+
+						n, err := WriteMP3(fmt.Sprintf("%04d.mp3", is.i+off), rsp.AudioStream)
+						if err != nil {
+							// fmt.Fprintf(os.Stderr, errfmt, err, section)
+							printError(err, sentence)
+							continue
+						}
+						atomic.AddInt64(&size, n)
 						off++
-						result.AudioStream.Close()
+						rsp.AudioStream.Close()
 					}
 					continue
 				}
 
-				writeAudio(name, &size, is.i+off, result.AudioStream)
-				result.AudioStream.Close()
-
+				n, err := WriteMP3(fmt.Sprintf("%04d.mp3", is.i+off), rsp.AudioStream)
+				if err != nil {
+					// fmt.Fprintf(os.Stderr, errfmt, err, s)
+					printError(err, section)
+					os.Exit(5)
+				}
+				atomic.AddInt64(&size, n)
+				rsp.AudioStream.Close()
 			}
-
 		}(i)
 	}
-
 	return p
 }
 
-func writeAudio(name string, size *int64, i int, stream io.Reader) {
-	data, err := ioutil.ReadAll(stream)
+func WriteMP3(filename string, fin io.Reader) (int64, error) {
+	fout, err := os.Create(filename)
 	if err != nil {
-		log.Error(err)
-		return
+		return 0, err
 	}
+	defer fout.Close()
 
-	filename := fmt.Sprintf("%s%04d.mp3", name, i)
-	err = ioutil.WriteFile(filename, data, 0644)
-	if err != nil {
-		log.Error(err)
-	}
-
-	atomic.AddInt64(size, int64(len(data)))
-	// log.Infof("%s: %s / %s", filename, humanize.Bytes(uint64(len(data))), humanize.Bytes(uint64(*size)))
+	return io.Copy(fout, fin)
 }
 
 func (p *Polly) Close() error {
@@ -245,56 +267,67 @@ func (p Polly) SayAll(phrases []string) {
 }
 
 func pollyError(err error) {
-	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case polly.ErrCodeTextLengthExceededException:
-				log.Errorln(polly.ErrCodeTextLengthExceededException, aerr.Error())
-			case polly.ErrCodeInvalidSampleRateException:
-				log.Errorln(polly.ErrCodeInvalidSampleRateException, aerr.Error())
-			case polly.ErrCodeInvalidSsmlException:
-				log.Errorln(polly.ErrCodeInvalidSsmlException, aerr.Error())
-			case polly.ErrCodeLexiconNotFoundException:
-				log.Errorln(polly.ErrCodeLexiconNotFoundException, aerr.Error())
-			case polly.ErrCodeServiceFailureException:
-				log.Errorln(polly.ErrCodeServiceFailureException, aerr.Error())
-			case polly.ErrCodeMarksNotSupportedForFormatException:
-				log.Errorln(polly.ErrCodeMarksNotSupportedForFormatException, aerr.Error())
-			case polly.ErrCodeSsmlMarksNotSupportedForTextTypeException:
-				log.Errorln(polly.ErrCodeSsmlMarksNotSupportedForTextTypeException, aerr.Error())
-			default:
-				log.Errorln(aerr.Error())
-			}
-		} else {
-			// Print the error, cast err to awserr.Error to get the Code and
-			// Message from an error.
-			log.Errorln(err.Error())
-		}
+	if err == nil {
+		return
+	}
+	// Print the error, cast err to awserr.Error to get the Code and message from
+	// an error.
+	aerr, ok := err.(awserr.Error)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 		return
 	}
 
+	switch aerr.Code() {
+	case polly.ErrCodeTextLengthExceededException:
+		fmt.Fprintf(os.Stderr, "AWS Poly error #%d: %s\n", polly.ErrCodeTextLengthExceededException, aerr.Error())
+	case polly.ErrCodeInvalidSampleRateException:
+		fmt.Fprintf(os.Stderr, "AWS Poly error #%d: %s\n", polly.ErrCodeInvalidSampleRateException, aerr.Error())
+	case polly.ErrCodeInvalidSsmlException:
+		fmt.Fprintf(os.Stderr, "AWS Poly error #%d: %s\n", polly.ErrCodeInvalidSsmlException, aerr.Error())
+	case polly.ErrCodeLexiconNotFoundException:
+		fmt.Fprintf(os.Stderr, "AWS Poly error #%d: %s\n", polly.ErrCodeLexiconNotFoundException, aerr.Error())
+	case polly.ErrCodeServiceFailureException:
+		fmt.Fprintf(os.Stderr, "AWS Poly error #%d: %s\n", polly.ErrCodeServiceFailureException, aerr.Error())
+	case polly.ErrCodeMarksNotSupportedForFormatException:
+		fmt.Fprintf(os.Stderr, "AWS Poly error #%d: %s\n", polly.ErrCodeMarksNotSupportedForFormatException, aerr.Error())
+	case polly.ErrCodeSsmlMarksNotSupportedForTextTypeException:
+		fmt.Fprintf(os.Stderr, "AWS Poly error #%d: %s\n", polly.ErrCodeSsmlMarksNotSupportedForTextTypeException, aerr.Error())
+	default:
+		fmt.Fprintf(os.Stderr, "AWS Poly error #%d: %s\n", aerr.Error())
+	}
 }
-func parseFile(filename string) []string {
 
-	abs, err := filepath.Abs(filename)
-	if err != nil {
-		log.Fatalf("error opening %q: %s", filename, err)
+func ReadTextInput(filename string) []string {
+	var out []string
+	if len(filename) == 0 {
+		return out
 	}
 
-	f, err := os.Open(abs)
-	if err != nil {
-		log.Fatalf("error opening %q: %s", abs, err)
-	}
-	defer f.Close()
+	// path, err := filepath.Abs(filename)
+	// if err != nil {
+	// 	fmt.Fprintf(os.Stderr, "error opening %q: %s", filename, err)
+	// 	return out
+	// }
+	data, err := ioutil.ReadFile(filename)
+	// f, err := os.Open(path)
+	// if err != nil {
+	// 	fmt.Fprintf(os.Stderr, "error opening %q: %s", filename, err)
+	// 	return out
+	// }
+	// defer f.Close()
 
-	data, err := ioutil.ReadAll(f)
+	// data, err := ioutil.ReadAll(f)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Fprintf(os.Stderr, "error reading %s %s\n", filename, err)
+		return out
 	}
-	log.Infof("finished reading %q", filename)
+	// log.Infof("finished reading %q", filename)
 	var runeData []rune
 	for _, r := range []rune(string(data)) {
 		switch r {
+		case '#':
+			runeData = append(runeData, []rune("&hash;")...)
 		case '<':
 			runeData = append(runeData, []rune("&lt;")...)
 		case '>':
@@ -302,8 +335,11 @@ func parseFile(filename string) []string {
 		case '&':
 			runeData = append(runeData, []rune("&amp;")...)
 		case '"':
+		case '“':
+		case '”':
 			runeData = append(runeData, []rune("&quot;")...)
 		case '\'':
+		case '’':
 			runeData = append(runeData, []rune("&apos;")...)
 		case '¢':
 			runeData = append(runeData, []rune("&cent;")...)
@@ -323,7 +359,6 @@ func parseFile(filename string) []string {
 	}
 
 	paragraphs := strings.Split(string(runeData), "\n")
-	var blocks []string
 	var block string
 
 	// for each newline
@@ -339,8 +374,9 @@ func parseFile(filename string) []string {
 			block += paragraphs[i] + "\n"
 			continue
 		}
+
 		// if it is too big, save the existing block, and create a new empty one.
-		blocks = append(blocks, block)
+		out = append(out, block)
 		block = ""
 
 		// if it fits now, add it to the new block and continue
@@ -357,17 +393,31 @@ func parseFile(filename string) []string {
 			}
 
 			// if it is too big, save the existing block, and create a new empty one.
-			blocks = append(blocks, block)
+			out = append(out, block)
 			block = ""
 
 			if len(block)+len(sentence)+1 < 1500 {
 				block = sentence + "."
 				continue
 			}
-			log.Fatalf("sentence is too long for a single request %q", sentence)
+			fmt.Fprintf(os.Stderr, "sentence is too long for a single request %q\n", sentence)
 		}
 	}
-	return append(blocks, block)
+
+	return append(out, block)
+}
+
+func TildePath(path string) (string, error) {
+	if !strings.HasPrefix(path, "~") {
+		return path, nil
+	}
+
+	home, err := homedir.Dir()
+	if err != nil {
+		return path, err
+	}
+
+	return filepath.Join(home, strings.TrimLeft(path, "~/")), nil
 }
 
 // notes on direct playback via portaudio
